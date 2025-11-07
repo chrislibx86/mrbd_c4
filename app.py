@@ -14,6 +14,7 @@ DB_NAME = "p3_marcosref_reclibros"
 def conexion_mongo():
     uri = "mongodb+srv://temporal_1:MPMXmpxTQnDB2ph1@cluster0.icuj9td.mongodb.net/?appName=Cluster0"
     cliente = MongoClient(uri, server_api=ServerApi('1'))
+
     return cliente[DB_NAME]
 
 db = conexion_mongo()
@@ -21,6 +22,16 @@ db = conexion_mongo()
 # --------------------------------------------------------------------------------------
 # 2. Cargar libros y usuarios desde MongoDB
 # --------------------------------------------------------------------------------------
+if "libros" not in db.list_collection_names():
+    df_libros = pd.read_csv("libros_ej3.csv")
+    db["libros"].insert_many(df_libros.to_dict("records"))
+
+if "usuarios" not in db.list_collection_names():
+    usuarios_default = [
+        {"nombre": n} for n in ["Freddy", "Eduardo", "Jimmy"]
+    ]
+    db["usuarios"].insert_many(usuarios_default)
+
 df_libros = pd.DataFrame(list(db["libros"].find({}, {"_id": 0})))
 
 
@@ -32,12 +43,6 @@ if not columnas_requeridas.issubset(set(df_libros.columns)):
     st.error(f"❌ Las columnas necesarias no están presentes en la colección 'libros'.\nColumnas encontradas: {list(df_libros.columns)}")
     st.stop()
 
-
-if "usuarios" not in db.list_collection_names():
-    usuarios_default = [
-        {"nombre": n} for n in ["Freddy", "Eduardo", "Jimmy"]
-    ]
-    db["usuarios"].insert_many(usuarios_default)
 
 
 usuarios = [u["nombre"] for u in db["usuarios"].find({}, {"_id": 0, "nombre": 1})]
