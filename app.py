@@ -1,87 +1,179 @@
-# -----------------------------
-# RECOMENDADDOR KAPPA
-# -----------------------------
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from pymongo.mongo_client import MongoClient
+from pymongo.server_api import ServerApi
+from datetime import datetime
 
-st.set_page_config(page_title="EMendieta - Recomendador de libros - Arquitectura Kappa", layout="wide")
+# --------------------------------------------------------------------------------------
+# 1. Conexión con MongoDB
+# --------------------------------------------------------------------------------------
+DB_NAME = "p3_marcosref_reclibros"
 
-# -----------------------------
-# CARGA DE DATOS INICIALES
-# -----------------------------
-st.title("Recomendador de libros con arquitectura Kappa")
+def conexion_mongo():
+    uri = "mongodb+srv://temporal_1:MPMXmpxTQnDB2ph1@cluster0.icuj9td.mongodb.net/?appName=Cluster0"
+    cliente = MongoClient(uri, server_api=ServerApi('1'))
+    return cliente[DB_NAME]
 
-df_libros = pd.read_csv("data/libros_amazon.csv")
+db = conexion_mongo()
 
-# Limpiamos columnas útiles
-df_libros = df_libros[[
-    "CodigoASIN", "Titulo", "Valoracion", "NumeroResenas", "Categorias"
-]]
-
-# Extraer solo el número de la valoración ("4.6 out of 5 stars" -> 4.6)
-df_libros["Valoracion"] = df_libros["Valoracion"].str.extract(r"(\d+\.\d+)").astype(float)
-df_libros["Categorias"] = df_libros["Categorias"].str.replace(r"[\[\]\"']", "", regex=True)
-
-# -----------------------------
-# CAPA DE STREAMING
-# -----------------------------
-st.header("Flujo de datos en tiempo real")
-
-# Simulamos entrada de un nuevo evento
-nuevo_titulo = st.text_input("Nuevo libro leído:")
-nueva_valoracion = st.slider("Valoración del libro", 1.0, 5.0, 4.5, 0.1)
-nuevas_categorias = st.text_input("Categorías:", "Books, Literature & Fiction")
-
-if "df_stream" not in st.session_state:
-    st.session_state["df_stream"] = df_libros.copy()
+# --------------------------------------------------------------------------------------
+# 2. Cargar libros y usuarios desde MongoDB
+# --------------------------------------------------------------------------------------
+df_libros = pd.DataFrame(list(db["libros"].find({}, {"_id": 0})))
 
 
-if st.button("Enviar nuevo evento"):
-    nuevo_registro = {
-        "CodigoASIN": f"NEW{len(st.session_state['df_stream'])+1}",
-        "Titulo": nuevo_titulo,
-        "Valoracion": nueva_valoracion,
-        "NumeroResenas": np.random.randint(1, 5000),
-        "Categorias": nuevas_categorias
-    }
-    st.session_state["df_stream"] = pd.concat(
-        [st.session_state["df_stream"], pd.DataFrame([nuevo_registro])],
-        ignore_index=True
+df_libros.columns = df_libros.columns.str.strip().str.lower()
+
+
+columnas_requeridas = {"nombre", "complejidad", "popularidad"}
+if not columnas_requeridas.issubset(set(df_libros.columns)):
+    st.error(f"❌ Las columnas necesarias no están presentes en la colección 'libros'.\nColumnas encontradas: {list(df_libros.columns)}")
+    st.stop()
+
+
+if "usuarios" not in db.list_collection_names():
+    usuarios_default = [
+        {"nombre": n} for n in ["Freddy", "Eduardo", "Jimmy"]
+    ]
+    db["usuarios"].insert_many(usuarios_default)
+
+
+usuarios = [u["nombre"] for u in db["usuarios"].find({}, {"_id": 0, "nombre": 1})]
+nombres_libros = df_libros["nombre"].tolist()
+
+# --------------------------------------------------------------------------------------
+# 3. Función de cálculo de similitud y guardado en MongoDB
+# --------------------------------------------------------------------------------------
+def calcular_similitud(df_calificaciones, df_relevancia, df_profundidad, df_caracteristicas_libro):
+    calificaciones_transp = df_calificaciones.T
+    relevancia_transp = df_relevancia.T
+    profundidad_transp = df_profundidad.T
+
+    calificaciones_transp.columns = [f"{u}_calif" for u in usuarios]
+    relevancia_transp.columns = [f"{u}_relev" for u in usuarios]
+    profundidad_transp.columns = [f"{u}_prof" for u in usuarios]
+
+    temp_dinamica = pd.concat([calificaciones_transp, relevancia_transp, profundidad_transp], axis=1)
+    libros_comunes = list(set(temp_dinamica.index) & set(df_caracteristicas_libro.index))
+
+    dinamicas = temp_dinamica.loc[libros_comunes]
+    estaticas = df_caracteristicas_libro.loc[libros_comunes]
+
+    combinadas = pd.concat([dinamicas, estaticas], axis=1)
+    matriz_similitud = pd.DataFrame(
+        cosine_similarity(combinadas),
+        index=combinadas.index,
+        columns=combinadas.index
     )
-    st.success(f"Nuevo libro agregado: {nuevo_titulo}")
 
+    db["similitud_libros"].delete_many({})
+    registros = []
+    for libro in matriz_similitud.index:
+        similares = matriz_similitud.loc[libro].sort_values(ascending=False)[1:6]
+        registros.append({
+            "base": libro,
+            "similares": [{"nombre": n, "similitud": float(sim)} for n, sim in similares.items()]
+        })
+    if registros:
+        db["similitud_libros"].insert_many(registros)
 
-st.header("Modelo Streaming)")
+    return matriz_similitud
 
-df = st.session_state["df_stream"]
+# --------------------------------------------------------------------------------------
+# 4. Configuración inicial del modelo
+# --------------------------------------------------------------------------------------
+st.set_page_config(page_title="Eduardo Mendieta - Recomendador de libros MongoDB", layout="wide")
 
+if "calificaciones" not in st.session_state:
+    shape = (len(usuarios), len(nombres_libros))
+    st.session_state.calificaciones = pd.DataFrame(np.random.randint(1, 6, shape), index=usuarios, columns=nombres_libros)
+    st.session_state.relevancia = pd.DataFrame(np.random.randint(1, 6, shape), index=usuarios, columns=nombres_libros)
+    st.session_state.profundidad = pd.DataFrame(np.random.randint(1, 6, shape), index=usuarios, columns=nombres_libros)
 
-vectorizer = TfidfVectorizer(stop_words="english")
-tfidf_matrix = vectorizer.fit_transform(df["Categorias"])
+    df_caracteristicas = (
+        df_libros[["nombre", "complejidad", "popularidad"]]
+        .rename(columns={
+            "nombre": "Libro",
+            "complejidad": "Complejidad de Lectura",
+            "popularidad": "Popularidad Global"
+        })
+        .set_index("Libro")
+    )
 
+    st.session_state.caracteristicas_libro = df_caracteristicas
+    st.session_state.similitud = calcular_similitud(
+        st.session_state.calificaciones,
+        st.session_state.relevancia,
+        st.session_state.profundidad,
+        st.session_state.caracteristicas_libro
+    )
 
-sim_matrix = cosine_similarity(tfidf_matrix, tfidf_matrix)
+# --------------------------------------------------------------------------------------
+# 5. Capa Batch
+# --------------------------------------------------------------------------------------
+st.title("📚 Recomendador de libros con MongoDB y arquitectura Lambda")
+st.caption("Capa Batch + Velocidad + Servicio con persistencia de datos")
 
-# -----------------------------
-# CAPA DE SERVICIO
-# -----------------------------
-st.header("Recomendaciones en tiempo real")
+st.subheader("🧩 Capa Batch - Datos base")
+col1, col2 = st.columns(2)
 
-libro_base = st.selectbox("Selecciona un libro base:", df["Titulo"])
+with col1:
+    st.markdown("**Calificaciones históricas simuladas**")
+    st.dataframe(st.session_state.calificaciones)
 
-if libro_base:
-    idx = df.index[df["Titulo"] == libro_base][0]
-    similitudes = pd.Series(sim_matrix[idx], index=df["Titulo"]).sort_values(ascending=False)
-    recomendaciones = similitudes[1:6]  # top 5 similares
+with col2:
+    st.markdown("**Características estáticas de libros (desde MongoDB)**")
+    st.dataframe(st.session_state.caracteristicas_libro)
 
-    st.write(f"Libros similares a **{libro_base}**:")
-    st.dataframe(recomendaciones.round(3), use_container_width=True)
-    st.bar_chart(recomendaciones)
+# --------------------------------------------------------------------------------------
+# 6. Capa de velocidad
+# --------------------------------------------------------------------------------------
+st.header("⚡ Capa de velocidad - Calificación en tiempo real")
 
-st.info("Eduardo Mendieta.")
+usuario = st.selectbox("Selecciona un usuario:", usuarios)
+libro = st.selectbox("Selecciona un libro:", nombres_libros)
 
+calif = st.slider("Calificación (1-5)", 1, 5, 3)
+relev = st.slider("Relevancia personal (1-5)", 1, 5, 3)
+prof = st.slider("Profundidad de lectura (1-5)", 1, 5, 3)
 
+if st.button("➕ Guardar opinión y recalcular modelo"):
+    st.session_state.calificaciones.loc[usuario, libro] = calif
+    st.session_state.relevancia.loc[usuario, libro] = relev
+    st.session_state.profundidad.loc[usuario, libro] = prof
+
+    db["opiniones"].insert_one({
+        "usuario": usuario,
+        "libro": libro,
+        "calificacion": calif,
+        "relevancia": relev,
+        "profundidad": prof,
+        "fecha": datetime.utcnow().isoformat()
+    })
+
+    st.session_state.similitud = calcular_similitud(
+        st.session_state.calificaciones,
+        st.session_state.relevancia,
+        st.session_state.profundidad,
+        st.session_state.caracteristicas_libro
+    )
+
+    st.success(f"✅ Opinión de {usuario} sobre '{libro}' guardada y similitud actualizada.")
+
+# --------------------------------------------------------------------------------------
+# 7. Capa de servicio
+# --------------------------------------------------------------------------------------
+st.header("🛰️ Capa de servicio - Recomendaciones desde MongoDB")
+
+libro_sel = st.selectbox("Selecciona un libro base:", nombres_libros)
+doc = db["similitud_libros"].find_one({"base": libro_sel}, {"_id": 0})
+
+if doc:
+    st.write(f"🔍 Libros más similares a **{libro_sel}**:")
+    st.dataframe(pd.DataFrame(doc["similares"]))
+else:
+    st.warning("⚠️ No se encontró similitud almacenada para este libro.")
+
+st.info("**Estudiante:** Eduardo Mendieta.")
